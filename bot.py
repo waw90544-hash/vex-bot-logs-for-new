@@ -7,7 +7,7 @@ from typing import Optional, Iterable
 import discord
 from discord.ext import commands
 
-TOKEN = "Discord_token"
+TOKEN = os.getenv("discord_token")
 PREFIXES = ["!", "."]
 DATA_FILE = "guild_log_config.json"
 UTC = timezone.utc
@@ -1093,3 +1093,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("TOKEN not found. Set DISCORD_TOKEN in environment variables.")
     bot.run(TOKEN, log_handler=None)
+
