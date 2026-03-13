@@ -1,0 +1,19 @@
+{
+    "1481266230143746090": {
+        "logs": {
+            "message": null,
+            "member": null,
+            "voice": null,
+            "mod": null,
+            "server": null,
+            "auto": null
+        },
+        "warnings": {},
+        "setup_done": false,
+        "created_roles": [],
+        "created_channels": [],
+        "created_categories": [],
+        "created_panel_messages": [],
+        "owner_role_name": "owner"
+    }
+}
