@@ -35,6 +35,7 @@ bot = commands.Bot(
     case_insensitive=True,
 )
 
+
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {}
@@ -202,6 +203,39 @@ async def recent_audit_actor(
     except Exception:
         return None
     return None
+
+
+async def recent_voice_audit_actor(
+    guild: discord.Guild,
+    action: discord.AuditLogAction,
+    member_id: Optional[int] = None,
+    within_seconds: int = 15,
+) -> Optional[discord.abc.User]:
+    me = guild.me
+    if me is None or not me.guild_permissions.view_audit_log:
+        return None
+
+    await asyncio.sleep(1.2)
+    now = discord.utils.utcnow()
+    fallback = None
+
+    try:
+        async for entry in guild.audit_logs(limit=10, action=action):
+            if entry.created_at and (now - entry.created_at).total_seconds() > within_seconds:
+                continue
+
+            target_id = getattr(entry.target, "id", None)
+
+            if member_id is not None and target_id == member_id:
+                return entry.user
+
+            if fallback is None:
+                fallback = entry.user
+
+    except Exception:
+        return None
+
+    return fallback
 
 
 def staff_roles_from_guild(guild: discord.Guild) -> list[discord.Role]:
@@ -463,17 +497,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     voice_log_channel = guild.get_channel(VOICE_LOG_CHANNEL_ID)
     voice_status_channel = guild.get_channel(VOICE_STATUS_CHANNEL_ID)
 
-    # تجاهل لو ما تغير شيء مهم
-    if (
-        before.channel == after.channel
-        and before.mute == after.mute
-        and before.deaf == after.deaf
-        and before.self_mute == after.self_mute
-        and before.self_deaf == after.self_deaf
-    ):
-        return
-
-    # دخول روم صوتي -> روم الدخول والخروج
     if before.channel is None and after.channel is not None:
         if voice_status_channel:
             embed = make_embed("🎤 دخول روم صوتي", color=SUCCESS_COLOR)
@@ -482,35 +505,35 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await safe_send(voice_status_channel, embed)
         return
 
-    # خروج من روم صوتي أو Disconnect
     if before.channel is not None and after.channel is None:
-        actor = await recent_audit_actor(
+        actor = await recent_voice_audit_actor(
             guild,
             discord.AuditLogAction.member_disconnect,
-            target_id=member.id,
-            within_seconds=10,
+            member_id=member.id,
+            within_seconds=15,
         )
 
-        if actor and voice_log_channel:
-            embed = make_embed("🔌 فصل عضو من الروم الصوتي", color=ERROR_COLOR)
-            embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-            embed.add_field(name="تم فصله من", value=before.channel.mention, inline=True)
-            embed.add_field(name="بواسطة", value=f"{actor.mention}\n`{actor.id}`", inline=False)
-            await safe_send(voice_log_channel, embed)
-        elif voice_status_channel:
-            embed = make_embed("📤 خروج من روم صوتي", color=WARN_COLOR)
-            embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-            embed.add_field(name="خرج من", value=before.channel.mention, inline=True)
-            await safe_send(voice_status_channel, embed)
+        if actor and actor.id != member.id:
+            if voice_log_channel:
+                embed = make_embed("🔌 فصل عضو من الروم الصوتي", color=ERROR_COLOR)
+                embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+                embed.add_field(name="تم فصله من", value=before.channel.mention, inline=True)
+                embed.add_field(name="بواسطة", value=f"{actor.mention}\n`{actor.id}`", inline=False)
+                await safe_send(voice_log_channel, embed)
+        else:
+            if voice_status_channel:
+                embed = make_embed("📤 خروج من روم صوتي", color=WARN_COLOR)
+                embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+                embed.add_field(name="خرج من", value=before.channel.mention, inline=True)
+                await safe_send(voice_status_channel, embed)
         return
 
-    # نقل بين الرومات -> روم الفصل والموف
     if before.channel is not None and after.channel is not None and before.channel != after.channel:
-        actor = await recent_audit_actor(
+        actor = await recent_voice_audit_actor(
             guild,
             discord.AuditLogAction.member_move,
-            target_id=member.id,
-            within_seconds=10,
+            member_id=member.id,
+            within_seconds=15,
         )
 
         if voice_log_channel:
@@ -520,29 +543,29 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             embed.add_field(name="إلى", value=after.channel.mention, inline=True)
             embed.add_field(
                 name="بواسطة",
-                value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
+                value=f"{actor.mention}\n`{actor.id}`" if actor and actor.id != member.id else "غير معروف",
                 inline=False,
             )
             await safe_send(voice_log_channel, embed)
         return
 
-    # باقي تغييرات الصوت مثل mute/deaf تظل في روم voice العادي من نظام اللوقات
     changes = []
+
     if before.mute != after.mute:
         changes.append(f"Server Mute: `{before.mute}` -> `{after.mute}`")
+
     if before.deaf != after.deaf:
         changes.append(f"Server Deaf: `{before.deaf}` -> `{after.deaf}`")
-    if before.self_mute != after.self_mute:
-        changes.append(f"Self Mute: `{before.self_mute}` -> `{after.self_mute}`")
-    if before.self_deaf != after.self_deaf:
-        changes.append(f"Self Deaf: `{before.self_deaf}` -> `{after.self_deaf}`")
 
-    if changes:
-        embed = make_embed("تغيرت حالة الصوت")
-        embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-        embed.add_field(name="الروم", value=after.channel.mention if after.channel else "-", inline=True)
-        embed.add_field(name="التغييرات", value=truncate("\n".join(changes), 1000), inline=False)
-        await send_log(member.guild, "voice", embed)
+    if not changes:
+        return
+
+    embed = make_embed("تغيرت حالة الصوت", color=WARN_COLOR)
+    embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+    embed.add_field(name="الروم", value=after.channel.mention if after.channel else "-", inline=True)
+    embed.add_field(name="التغييرات", value=truncate("\n".join(changes), 1000), inline=False)
+
+    await send_log(member.guild, "voice", embed)
 
 
 @bot.event
@@ -1091,6 +1114,5 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise RuntimeError("TOKEN not found. Set DISCORD_TOKEN in environment variables.")
+        raise RuntimeError("TOKEN not found. Set discord_token in environment variables.")
     bot.run(TOKEN, log_handler=None)
-
