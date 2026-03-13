@@ -3,7 +3,9 @@ import json
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Iterable
+from threading import Thread
 
+from flask import Flask
 import discord
 from discord.ext import commands
 
@@ -22,6 +24,24 @@ VOICE_STATUS_CHANNEL_ID = 1481886482166845531   # دخول + خروج + انتق
 
 VOICE_AUDIT_DELAY = 1.6
 VOICE_AUDIT_WINDOW = 8
+
+# =========================
+# Flask for Render Web Service
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is alive", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+def keep_alive():
+    thread = Thread(target=run_web)
+    thread.daemon = True
+    thread.start()
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -1193,4 +1213,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("TOKEN not found. Set discord_token in environment variables.")
+
+    keep_alive()
     bot.run(TOKEN, log_handler=None)
