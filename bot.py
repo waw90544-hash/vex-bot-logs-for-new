@@ -17,8 +17,11 @@ ERROR_COLOR = discord.Color.red()
 SUCCESS_COLOR = discord.Color.green()
 WARN_COLOR = discord.Color.orange()
 
-VOICE_LOG_CHANNEL_ID = 1481859663526887555      # فصل + موف
-VOICE_STATUS_CHANNEL_ID = 1481850652299886654   # دخول + خروج
+VOICE_LOG_CHANNEL_ID = 1481859663526887555      # فصل + سحب + ميوت/ديفن إداري
+VOICE_STATUS_CHANNEL_ID = 1481886482166845531   # دخول + خروج + انتقال طبيعي
+
+VOICE_AUDIT_DELAY = 1.6
+VOICE_AUDIT_WINDOW = 8
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -182,6 +185,12 @@ async def send_log(guild: discord.Guild, key: str, embed: discord.Embed) -> None
     await safe_send(channel, embed)
 
 
+def actor_text(user: Optional[discord.abc.User]) -> str:
+    if user is None:
+        return "غير معروف"
+    return f"{user.mention}\n`{user.id}`"
+
+
 async def recent_audit_actor(
     guild: discord.Guild,
     action: discord.AuditLogAction,
@@ -205,37 +214,123 @@ async def recent_audit_actor(
     return None
 
 
-async def recent_voice_audit_actor(
+async def get_recent_audit_entries(
     guild: discord.Guild,
     action: discord.AuditLogAction,
-    member_id: Optional[int] = None,
-    within_seconds: int = 15,
-) -> Optional[discord.abc.User]:
-    me = guild.me
+    *,
+    limit: int = 12,
+    within_seconds: int = VOICE_AUDIT_WINDOW,
+) -> list[discord.AuditLogEntry]:
+    me = guild.me or guild.get_member(bot.user.id if bot.user else 0)
     if me is None or not me.guild_permissions.view_audit_log:
-        return None
+        return []
 
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(VOICE_AUDIT_DELAY)
     now = discord.utils.utcnow()
-    fallback = None
+    entries: list[discord.AuditLogEntry] = []
 
     try:
-        async for entry in guild.audit_logs(limit=10, action=action):
-            if entry.created_at and (now - entry.created_at).total_seconds() > within_seconds:
+        async for entry in guild.audit_logs(limit=limit, action=action):
+            if entry.created_at is None:
                 continue
 
-            target_id = getattr(entry.target, "id", None)
+            age = (now - entry.created_at).total_seconds()
+            if age > within_seconds:
+                break
 
-            if member_id is not None and target_id == member_id:
-                return entry.user
-
-            if fallback is None:
-                fallback = entry.user
-
+            entries.append(entry)
     except Exception:
-        return None
+        return []
 
-    return fallback
+    return entries
+
+
+async def find_voice_move_actor(
+    guild: discord.Guild,
+    member_id: int,
+    to_channel_id: int,
+) -> Optional[discord.abc.User]:
+    entries = await get_recent_audit_entries(guild, discord.AuditLogAction.member_move)
+
+    for entry in entries:
+        if getattr(entry.target, "id", None) == member_id:
+            return entry.user
+
+    channel_matches = []
+    for entry in entries:
+        extra = getattr(entry, "extra", None)
+        moved_to = getattr(getattr(extra, "channel", None), "id", None)
+        count = getattr(extra, "count", None)
+
+        if moved_to == to_channel_id and count == 1:
+            channel_matches.append(entry)
+
+    if len(channel_matches) == 1:
+        return channel_matches[0].user
+
+    single_entries = []
+    for entry in entries:
+        extra = getattr(entry, "extra", None)
+        count = getattr(extra, "count", None)
+        if count == 1:
+            single_entries.append(entry)
+
+    if len(entries) == 1 and len(single_entries) == 1:
+        return single_entries[0].user
+
+    return None
+
+
+async def find_voice_disconnect_actor(
+    guild: discord.Guild,
+    member_id: int,
+) -> Optional[discord.abc.User]:
+    entries = await get_recent_audit_entries(guild, discord.AuditLogAction.member_disconnect)
+
+    for entry in entries:
+        if getattr(entry.target, "id", None) == member_id:
+            return entry.user
+
+    single_entries = []
+    for entry in entries:
+        extra = getattr(entry, "extra", None)
+        count = getattr(extra, "count", None)
+        if count == 1:
+            single_entries.append(entry)
+
+    if len(entries) == 1 and len(single_entries) == 1:
+        return single_entries[0].user
+
+    return None
+
+
+async def find_member_voice_state_actor(
+    guild: discord.Guild,
+    member_id: int,
+    field_name: str,
+    expected_after_value: bool,
+) -> Optional[discord.abc.User]:
+    entries = await get_recent_audit_entries(
+        guild,
+        discord.AuditLogAction.member_update,
+        limit=15,
+        within_seconds=10,
+    )
+
+    for entry in entries:
+        if getattr(entry.target, "id", None) != member_id:
+            continue
+
+        before_value = getattr(entry.before, field_name, None)
+        after_value = getattr(entry.after, field_name, None)
+
+        if before_value is None and after_value is None:
+            continue
+
+        if after_value == expected_after_value:
+            return entry.user
+
+    return None
 
 
 def staff_roles_from_guild(guild: discord.Guild) -> list[discord.Role]:
@@ -440,11 +535,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     actor = await recent_audit_actor(guild, discord.AuditLogAction.ban, target_id=user.id)
     embed = make_embed("تم حظر عضو", color=ERROR_COLOR)
     embed.add_field(name="المستهدف", value=f"{user}\n`{user.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(guild, "mod", embed)
 
 
@@ -453,11 +544,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     actor = await recent_audit_actor(guild, discord.AuditLogAction.unban, target_id=user.id)
     embed = make_embed("تم فك حظر عضو", color=SUCCESS_COLOR)
     embed.add_field(name="المستهدف", value=f"{user}\n`{user.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(guild, "mod", embed)
 
 
@@ -494,78 +581,91 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     guild = member.guild
-    voice_log_channel = guild.get_channel(VOICE_LOG_CHANNEL_ID)
-    voice_status_channel = guild.get_channel(VOICE_STATUS_CHANNEL_ID)
 
+    voice_log_channel = guild.get_channel(VOICE_LOG_CHANNEL_ID)
+    if not isinstance(voice_log_channel, discord.TextChannel):
+        voice_log_channel = None
+
+    voice_status_channel = guild.get_channel(VOICE_STATUS_CHANNEL_ID)
+    if not isinstance(voice_status_channel, discord.TextChannel):
+        voice_status_channel = None
+
+    # دخول روم
     if before.channel is None and after.channel is not None:
-        if voice_status_channel:
-            embed = make_embed("🎤 دخول روم صوتي", color=SUCCESS_COLOR)
+        embed = make_embed("🎤 دخول روم صوتي", color=SUCCESS_COLOR)
+        embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+        embed.add_field(name="دخل إلى", value=after.channel.mention, inline=True)
+        await safe_send(voice_status_channel, embed)
+        return
+
+    # خروج أو فصل
+    if before.channel is not None and after.channel is None:
+        actor = await find_voice_disconnect_actor(guild, member.id)
+
+        if actor and actor.id != member.id:
+            embed = make_embed("🔌 فصل عضو من الروم الصوتي", color=ERROR_COLOR)
             embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-            embed.add_field(name="دخل إلى", value=after.channel.mention, inline=True)
+            embed.add_field(name="من", value=before.channel.mention, inline=True)
+            embed.add_field(name="بواسطة", value=actor_text(actor), inline=False)
+            await safe_send(voice_log_channel, embed)
+        else:
+            embed = make_embed("📤 خروج من روم صوتي", color=WARN_COLOR)
+            embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+            embed.add_field(name="خرج من", value=before.channel.mention, inline=True)
             await safe_send(voice_status_channel, embed)
         return
 
-    if before.channel is not None and after.channel is None:
-        actor = await recent_voice_audit_actor(
-            guild,
-            discord.AuditLogAction.member_disconnect,
-            member_id=member.id,
-            within_seconds=15,
-        )
+    # انتقال طبيعي أو سحب إداري
+    if before.channel is not None and after.channel is not None and before.channel != after.channel:
+        actor = await find_voice_move_actor(guild, member.id, after.channel.id)
 
         if actor and actor.id != member.id:
-            if voice_log_channel:
-                embed = make_embed("🔌 فصل عضو من الروم الصوتي", color=ERROR_COLOR)
-                embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-                embed.add_field(name="تم فصله من", value=before.channel.mention, inline=True)
-                embed.add_field(name="بواسطة", value=f"{actor.mention}\n`{actor.id}`", inline=False)
-                await safe_send(voice_log_channel, embed)
-        else:
-            if voice_status_channel:
-                embed = make_embed("📤 خروج من روم صوتي", color=WARN_COLOR)
-                embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
-                embed.add_field(name="خرج من", value=before.channel.mention, inline=True)
-                await safe_send(voice_status_channel, embed)
-        return
-
-    if before.channel is not None and after.channel is not None and before.channel != after.channel:
-        actor = await recent_voice_audit_actor(
-            guild,
-            discord.AuditLogAction.member_move,
-            member_id=member.id,
-            within_seconds=15,
-        )
-
-        if voice_log_channel:
-            embed = make_embed("🔁 نقل عضو بين الرومات", color=EMBED_COLOR)
+            embed = make_embed("🔁 سحب عضو بين الرومات الصوتية", color=EMBED_COLOR)
             embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
             embed.add_field(name="من", value=before.channel.mention, inline=True)
             embed.add_field(name="إلى", value=after.channel.mention, inline=True)
-            embed.add_field(
-                name="بواسطة",
-                value=f"{actor.mention}\n`{actor.id}`" if actor and actor.id != member.id else "غير معروف",
-                inline=False,
-            )
+            embed.add_field(name="بواسطة", value=actor_text(actor), inline=False)
             await safe_send(voice_log_channel, embed)
+        else:
+            embed = make_embed("🔄 انتقال بين الرومات الصوتية", color=EMBED_COLOR)
+            embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
+            embed.add_field(name="من", value=before.channel.mention, inline=True)
+            embed.add_field(name="إلى", value=after.channel.mention, inline=True)
+            await safe_send(voice_status_channel, embed)
         return
 
-    changes = []
+    # تجاهل self mute / self deaf / stream / video
+    server_changes = []
+    actor = None
 
+    # Server Mute فقط
     if before.mute != after.mute:
-        changes.append(f"Server Mute: `{before.mute}` -> `{after.mute}`")
+        actor = await find_member_voice_state_actor(guild, member.id, "mute", after.mute)
+        if after.mute:
+            server_changes.append("تم إعطاء العضو ميوت سيرفر")
+        else:
+            server_changes.append("تم فك ميوت السيرفر عن العضو")
 
+    # Server Deaf فقط
     if before.deaf != after.deaf:
-        changes.append(f"Server Deaf: `{before.deaf}` -> `{after.deaf}`")
+        if actor is None:
+            actor = await find_member_voice_state_actor(guild, member.id, "deaf", after.deaf)
 
-    if not changes:
+        if after.deaf:
+            server_changes.append("تم إعطاء العضو ديفن سيرفر")
+        else:
+            server_changes.append("تم فك ديفن السيرفر عن العضو")
+
+    if not server_changes:
         return
 
-    embed = make_embed("تغيرت حالة الصوت", color=WARN_COLOR)
+    embed = make_embed("🎛️ تحديث حالة صوتية إدارية", color=WARN_COLOR)
     embed.add_field(name="العضو", value=f"{member.mention}\n`{member.id}`", inline=True)
     embed.add_field(name="الروم", value=after.channel.mention if after.channel else "-", inline=True)
-    embed.add_field(name="التغييرات", value=truncate("\n".join(changes), 1000), inline=False)
+    embed.add_field(name="التغييرات", value=truncate("\n".join(server_changes), 1000), inline=False)
+    embed.add_field(name="بواسطة", value=actor_text(actor), inline=False)
 
-    await send_log(member.guild, "voice", embed)
+    await safe_send(voice_log_channel, embed)
 
 
 @bot.event
@@ -578,11 +678,7 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
         inline=True,
     )
     embed.add_field(name="النوع", value=str(channel.type), inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(channel.guild, "server", embed)
 
 
@@ -592,11 +688,7 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     embed = make_embed("تم حذف روم", color=ERROR_COLOR)
     embed.add_field(name="الاسم", value=f"{channel.name}\n`{channel.id}`", inline=True)
     embed.add_field(name="النوع", value=str(channel.type), inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(channel.guild, "server", embed)
 
 
@@ -608,7 +700,9 @@ async def on_guild_channel_update(before: discord.abc.GuildChannel, after: disco
     if getattr(before, "topic", None) != getattr(after, "topic", None):
         changes.append("تم تعديل وصف الروم")
     if getattr(before, "slowmode_delay", None) != getattr(after, "slowmode_delay", None):
-        changes.append(f"السلو مود: `{getattr(before, 'slowmode_delay', 0)}` -> `{getattr(after, 'slowmode_delay', 0)}`")
+        changes.append(
+            f"السلو مود: `{getattr(before, 'slowmode_delay', 0)}` -> `{getattr(after, 'slowmode_delay', 0)}`"
+        )
 
     if not changes:
         return
@@ -616,11 +710,7 @@ async def on_guild_channel_update(before: discord.abc.GuildChannel, after: disco
     actor = await recent_audit_actor(after.guild, discord.AuditLogAction.channel_update, target_id=after.id)
     embed = make_embed("تم تحديث روم")
     embed.add_field(name="الروم", value=f"{after.name}\n`{after.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     embed.add_field(name="التغييرات", value=truncate("\n".join(changes), 1000), inline=False)
     await send_log(after.guild, "server", embed)
 
@@ -630,11 +720,7 @@ async def on_guild_role_create(role: discord.Role):
     actor = await recent_audit_actor(role.guild, discord.AuditLogAction.role_create, target_id=role.id)
     embed = make_embed("تم إنشاء رتبة", color=SUCCESS_COLOR)
     embed.add_field(name="الرتبة", value=f"{role.mention}\n`{role.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(role.guild, "server", embed)
 
 
@@ -643,11 +729,7 @@ async def on_guild_role_delete(role: discord.Role):
     actor = await recent_audit_actor(role.guild, discord.AuditLogAction.role_delete, target_id=role.id)
     embed = make_embed("تم حذف رتبة", color=ERROR_COLOR)
     embed.add_field(name="الاسم", value=f"{role.name}\n`{role.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     await send_log(role.guild, "server", embed)
 
 
@@ -669,11 +751,7 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
     actor = await recent_audit_actor(after.guild, discord.AuditLogAction.role_update, target_id=after.id)
     embed = make_embed("تم تحديث رتبة")
     embed.add_field(name="الرتبة", value=f"{after.mention}\n`{after.id}`", inline=True)
-    embed.add_field(
-        name="المنفذ",
-        value=f"{actor.mention}\n`{actor.id}`" if actor else "غير معروف",
-        inline=True,
-    )
+    embed.add_field(name="المنفذ", value=actor_text(actor), inline=True)
     embed.add_field(name="التغييرات", value=truncate("\n".join(changes), 1000), inline=False)
     await send_log(after.guild, "server", embed)
 
